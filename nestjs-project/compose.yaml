@@ -1,0 +1,110 @@
+services:
+  nestjs-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - 3000:3000
+    volumes:
+      - .:/home/node/app
+    depends_on:
+      db:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  # Video processing worker (FFmpeg): same image and source tree as the API,
+  # separate process/container consuming the RabbitMQ processing queue.
+  video-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command:
+      - sh
+      - -c
+      - |
+        until [ -d node_modules/@nestjs/microservices ]; do
+          echo "video-worker: waiting for npm install (docker compose exec nestjs-api npm install)"
+          sleep 5
+        done
+        exec npm run start:worker:dev
+    volumes:
+      - .:/home/node/app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  db:
+    image: postgres:17
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=streamtube
+      - POSTGRES_PASSWORD=streamtube
+      - POSTGRES_DB=streamtube
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streamtube"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mailpit:
+    image: axllent/mailpit
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  rabbitmq:
+    image: rabbitmq:4.1.8-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=streamtube
+      - RABBITMQ_DEFAULT_PASS=streamtube
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # minio/minio is no longer published on Docker Hub; Chainguard builds MinIO
+  # from source and only publishes `latest` on its free tier, so pin by digest.
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:0a01100085e30fb08d2f39e39c9f5c9d83a95707f220b007d813b690cd41622d
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=streamtube
+      - MINIO_ROOT_PASSWORD=streamtube-secret
+      - MC_HOST_local=http://streamtube:streamtube-secret@localhost:9000
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: cgr.dev/chainguard/minio-client@sha256:3b67177c0e12f44f646a5cf21b20fc5a79dd2d7a6b4db632b436f0b9e2e46717
+    command: ["mb", "--ignore-existing", "local/streamtube-videos"]
+    environment:
+      - MC_HOST_local=http://streamtube:streamtube-secret@minio:9000
+    depends_on:
+      minio:
+        condition: service_healthy
+
+volumes:
+  minio-data:
